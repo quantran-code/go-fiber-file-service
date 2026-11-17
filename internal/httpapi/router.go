@@ -10,8 +10,7 @@ import (
 	"github.com/quantran-code/go-fiber-file-service/internal/storage"
 )
 
-// Deps are the dependencies the file routes will use. The scaffold only serves
-// health; the feature tickets add routes on top of these seams.
+// Deps are the dependencies the file routes use.
 type Deps struct {
 	Files      files.Store
 	Storage    storage.Store
@@ -20,9 +19,17 @@ type Deps struct {
 
 // New builds the Fiber application.
 func New(deps Deps) *fiber.App {
+	// Uploads are copied straight from the request body into object storage, so
+	// the server hands the handler a body stream instead of parsing the
+	// multipart form (and buffering its parts) first. The body limit sits just
+	// above the file cap to leave room for the multipart framing; the upload
+	// handler enforces the cap on the part itself.
 	app := fiber.New(fiber.Config{
-		AppName:               "go-fiber-file-service",
-		DisableStartupMessage: true,
+		AppName:                      "go-fiber-file-service",
+		DisableStartupMessage:        true,
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+		BodyLimit:                    int(maxUploadBytes) + maxMultipartOverhead,
 	})
 
 	app.Get("/health", func(c *fiber.Ctx) error {
@@ -32,6 +39,8 @@ func New(deps Deps) *fiber.App {
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"service": "file-service", "status": "ok"})
 	})
+
+	registerFileRoutes(app, deps)
 
 	return app
 }
