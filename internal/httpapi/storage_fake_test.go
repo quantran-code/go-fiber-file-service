@@ -46,6 +46,8 @@ type fakeStorage struct {
 	putErr       error
 	getErr       error
 	statErr      error
+	overrideKey  string
+	override     []byte
 }
 
 var _ storage.Store = (*fakeStorage)(nil)
@@ -113,6 +115,27 @@ func (f *fakeStorage) deletedKeys() []string {
 	return append([]string(nil), f.deleted...)
 }
 
+// stored returns the bytes Get and Stat serve for key, with a corruption
+// override taking precedence over the uploaded object, together with the
+// recorded content type and whether the key exists. The caller holds the lock.
+func (f *fakeStorage) stored(key string) ([]byte, string, bool) {
+	if f.overrideKey == key {
+		return f.override, f.contentTypes[key], true
+	}
+	content, ok := f.objects[key]
+	return content, f.contentTypes[key], ok
+}
+
+// corrupt makes Get and Stat serve content for key instead of the bytes that
+// were uploaded, so a test can drive the stored bytes apart from the digest
+// taken at upload time. The recorded Put calls are left as they were.
+func (f *fakeStorage) corrupt(key string, content []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.overrideKey = key
+	f.override = append([]byte(nil), content...)
+}
+
 // Put streams body into memory and records the call. The whole body is never
 // needed by the handler at once, so the copy stays a plain io.Copy.
 func (f *fakeStorage) Put(ctx context.Context, key string, body io.Reader, size int64, contentType string) error {
@@ -144,8 +167,7 @@ func (f *fakeStorage) Get(ctx context.Context, key string, offset, length int64)
 	f.mu.Lock()
 	f.getCalls = append(f.getCalls, getCall{key: key, offset: offset, length: length})
 	getErr := f.getErr
-	content, ok := f.objects[key]
-	contentType := f.contentTypes[key]
+	content, contentType, ok := f.stored(key)
 	f.mu.Unlock()
 
 	if getErr != nil {
@@ -188,8 +210,7 @@ func (f *fakeStorage) Get(ctx context.Context, key string, offset, length int64)
 func (f *fakeStorage) Stat(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	f.mu.Lock()
 	statErr := f.statErr
-	content, ok := f.objects[key]
-	contentType := f.contentTypes[key]
+	content, contentType, ok := f.stored(key)
 	f.mu.Unlock()
 
 	if statErr != nil {

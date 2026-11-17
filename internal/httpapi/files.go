@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +35,10 @@ const (
 
 	// defaultContentType is stored when a part carries no usable content type.
 	defaultContentType = "application/octet-stream"
+
+	// sha256Header advertises the digest recorded for the object next to the
+	// bytes the content route serves.
+	sha256Header = "X-Content-SHA256"
 )
 
 var (
@@ -72,6 +78,18 @@ func (l *limitedPartReader) Read(p []byte) (int, error) {
 		return n, errTooLarge
 	}
 	return n, err
+}
+
+// sha256Hex streams r through SHA-256 and returns the digest as 64 lowercase
+// hex characters together with the number of bytes it read. It copies instead of
+// buffering, so an object can be hashed while it is being transferred.
+func sha256Hex(r io.Reader) (string, int64, error) {
+	hasher := sha256.New()
+	n, err := io.Copy(hasher, r)
+	if err != nil {
+		return "", n, fmt.Errorf("hashing the stream: %w", err)
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), n, nil
 }
 
 // sanitizeFileName strips any directory component from an uploaded name so a
@@ -173,6 +191,7 @@ func handleUpload(deps Deps) fiber.Handler {
 			fileName    string
 			contentType string
 			size        int64
+			digest      string
 		)
 
 		discard := func() {
@@ -211,9 +230,13 @@ func handleUpload(deps Deps) fiber.Handler {
 
 			// The part is copied straight from the request into storage. Its
 			// length is not known up front, so it is handed over as -1 and
-			// counted on the way through.
+			// counted on the way through. The digest is folded into that same
+			// pass: io.TeeReader hands every byte Put reads to the hasher, so
+			// the bytes stored are hashed without a second read or a buffer
+			// holding the part.
+			hasher := sha256.New()
 			limited := &limitedPartReader{r: part, limit: maxUploadBytes}
-			putErr := deps.Storage.Put(c.Context(), key, limited, -1, contentType)
+			putErr := deps.Storage.Put(c.Context(), key, io.TeeReader(limited, hasher), -1, contentType)
 			_ = part.Close()
 
 			if limited.exceeded {
@@ -227,6 +250,7 @@ func handleUpload(deps Deps) fiber.Handler {
 				return writeError(c, fiber.StatusBadGateway, "storage unavailable")
 			}
 			size = limited.n
+			digest = hex.EncodeToString(hasher.Sum(nil))
 		}
 
 		drainBody(c)
@@ -241,6 +265,7 @@ func handleUpload(deps Deps) fiber.Handler {
 			Name:        fileName,
 			Size:        size,
 			ContentType: contentType,
+			SHA256:      digest,
 			CreatedAt:   time.Now().UTC(),
 		}
 		if err := deps.Files.Add(file); err != nil {
@@ -409,6 +434,11 @@ func handleContent(deps Deps, headOnly bool) fiber.Handler {
 		if etag := strings.TrimSpace(info.ETag); etag != "" {
 			c.Set(fiber.HeaderETag, etag)
 		}
+		// The digest comes from the metadata record, so advertising it costs no
+		// object read and is available to both the GET and the HEAD answers.
+		if digest := strings.TrimSpace(file.SHA256); digest != "" {
+			c.Set(sha256Header, digest)
+		}
 		c.Set(fiber.HeaderAcceptRanges, "bytes")
 		c.Set(fiber.HeaderContentLength, strconv.FormatInt(contentLength, 10))
 		if status == fiber.StatusPartialContent {
@@ -423,12 +453,93 @@ func handleContent(deps Deps, headOnly bool) fiber.Handler {
 	}
 }
 
+// integrityResponse is the body of the integrity route. Error is only set when
+// the stored bytes do not match the recorded digest, so the verified answer
+// carries exactly the metadata fields.
+type integrityResponse struct {
+	ID        string    `json:"id"`
+	SHA256    string    `json:"sha256"`
+	Size      int64     `json:"size"`
+	Verified  bool      `json:"verified"`
+	CheckedAt time.Time `json:"checkedAt"`
+	Error     string    `json:"error,omitempty"`
+}
+
+// handleIntegrity recomputes the digest of a stored object and compares it with
+// the digest taken at upload time. The response always reports the stored
+// digest; the recomputed one is only used for the comparison.
+func handleIntegrity(deps Deps) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		file, ok := deps.Files.Get(c.Params("id"))
+		if !ok {
+			return writeError(c, fiber.StatusNotFound, "file not found")
+		}
+		if deps.Storage == nil {
+			return writeError(c, fiber.StatusServiceUnavailable, "storage unavailable")
+		}
+
+		// The stored object is authoritative for its size, so a metadata record
+		// whose size disagrees with storage is as much a mismatch as a different
+		// digest: the bytes that were hashed are not the bytes that were stored.
+		info, err := deps.Storage.Stat(c.Context(), file.Key)
+		if err != nil {
+			return writeStorageError(c, err)
+		}
+
+		object, err := deps.Storage.Get(c.Context(), file.Key, 0, 0)
+		if err != nil {
+			return writeStorageError(c, err)
+		}
+		recomputed, _, hashErr := sha256Hex(object.Body)
+		_ = object.Body.Close()
+		if hashErr != nil {
+			return writeError(c, fiber.StatusBadGateway, "storage unavailable")
+		}
+
+		response := integrityResponse{
+			ID:        file.ID,
+			SHA256:    file.SHA256,
+			Size:      info.Size,
+			Verified:  recomputed == file.SHA256 && info.Size == file.Size,
+			CheckedAt: time.Now().UTC(),
+		}
+		if !response.Verified {
+			response.Error = "integrity mismatch"
+			return c.Status(fiber.StatusConflict).JSON(response)
+		}
+		return c.JSON(response)
+	}
+}
+
+// handleListFiles returns the metadata of every stored file, newest first. It
+// never touches object storage.
+func handleListFiles(deps Deps) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		return c.JSON(deps.Files.List())
+	}
+}
+
+// handleFileMetadata returns one file's metadata record. It never touches
+// object storage either.
+func handleFileMetadata(deps Deps) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		file, ok := deps.Files.Get(c.Params("id"))
+		if !ok {
+			return writeError(c, fiber.StatusNotFound, "file not found")
+		}
+		return c.JSON(file)
+	}
+}
+
 // registerFileRoutes mounts the file routes on the application.
 func registerFileRoutes(app *fiber.App, deps Deps) {
 	app.Post("/files", handleUpload(deps))
+	app.Get("/files", handleListFiles(deps))
+	app.Get("/files/:id", handleFileMetadata(deps))
 	// app.Get also registers a HEAD route carrying the same handler, which
 	// would win over the explicit HEAD route below and make a HEAD request
 	// open the object. Adding the GET method directly keeps the two apart.
 	app.Add(fiber.MethodGet, "/files/:id/content", handleContent(deps, false))
 	app.Head("/files/:id/content", handleContent(deps, true))
+	app.Get("/files/:id/integrity", handleIntegrity(deps))
 }

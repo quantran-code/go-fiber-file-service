@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -227,18 +228,18 @@ func TestUploadReturnsMetadataAndStoresObject(t *testing.T) {
 		t.Fatalf("decoding the response body %q: %v", raw, err)
 	}
 
-	for _, field := range []string{"id", "name", "size", "contentType", "createdAt"} {
+	for _, field := range []string{"id", "name", "size", "contentType", "sha256", "createdAt"} {
 		if _, ok := payload[field]; !ok {
 			t.Fatalf("response %s carries no %q field", raw, field)
 		}
 	}
-	for _, internal := range []string{"key", "sha256"} {
+	for _, internal := range []string{"key"} {
 		if _, ok := payload[internal]; ok {
 			t.Fatalf("response %s exposes the internal %q field", raw, internal)
 		}
 	}
-	if len(payload) != 5 {
-		t.Fatalf("response %s carries %d fields, want 5", raw, len(payload))
+	if len(payload) != 6 {
+		t.Fatalf("response %s carries %d fields, want 6", raw, len(payload))
 	}
 
 	id, _ := payload["id"].(string)
@@ -296,6 +297,60 @@ func TestUploadReturnsMetadataAndStoresObject(t *testing.T) {
 	}
 	if record.ContentType != "text/plain; charset=utf-8" {
 		t.Fatalf("metadata content type %q, want %q", record.ContentType, "text/plain; charset=utf-8")
+	}
+}
+
+func TestUploadStoresSHA256(t *testing.T) {
+	store := newFakeStorage()
+	metadata := files.NewMemory()
+	app := New(Deps{Files: metadata, Storage: store, PresignTTL: testPresignTTL})
+
+	content := []byte("the digest is taken over exactly these bytes")
+	want, wantSize, err := sha256Hex(bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("hashing the expected content: %v", err)
+	}
+
+	body, contentType := multipartUpload(t, uploadPart{
+		field:       "file",
+		fileName:    "digest.txt",
+		contentType: "text/plain",
+		content:     content,
+	})
+
+	resp := postUpload(t, app, body, contentType)
+	if resp.StatusCode != 201 {
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("status %d, want 201 (body %s)", resp.StatusCode, raw)
+	}
+	payload := readJSONBody(t, resp)
+
+	got, _ := payload["sha256"].(string)
+	if got != want {
+		t.Fatalf("response sha256 %q, want %q", got, want)
+	}
+	decoded, err := hex.DecodeString(got)
+	if err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != got {
+		t.Fatalf("response sha256 %q is not 64 lowercase hex characters", got)
+	}
+
+	list := metadata.List()
+	if len(list) != 1 {
+		t.Fatalf("metadata store holds %d records, want 1", len(list))
+	}
+	if list[0].SHA256 != want {
+		t.Fatalf("metadata sha256 %q, want %q", list[0].SHA256, want)
+	}
+	if list[0].Size != wantSize {
+		t.Fatalf("metadata size %d, want the %d bytes that were hashed", list[0].Size, wantSize)
+	}
+
+	if puts := store.recordedPuts(); len(puts) != 1 {
+		t.Fatalf("storage recorded %d puts, want exactly one streaming upload", len(puts))
+	}
+	if gets := store.recordedGets(); len(gets) != 0 {
+		t.Fatalf("storage recorded %d gets for an upload, want 0: the digest is taken in the same pass as the write", len(gets))
 	}
 }
 

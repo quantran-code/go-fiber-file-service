@@ -40,12 +40,18 @@ func seedFile(t *testing.T, metadata *files.Memory, store *fakeStorage, name, co
 	key := objectKeyPrefix + id
 	store.seed(key, content, contentType)
 
+	digest, _, err := sha256Hex(bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("hashing the seeded content of %q: %v", name, err)
+	}
+
 	file := files.File{
 		ID:          id,
 		Key:         key,
 		Name:        name,
 		Size:        int64(len(content)),
 		ContentType: contentType,
+		SHA256:      digest,
 		CreatedAt:   time.Now().UTC(),
 	}
 	if err := metadata.Add(file); err != nil {
@@ -227,7 +233,7 @@ func TestHeadReturnsMetadataAndNoBody(t *testing.T) {
 		t.Fatalf("HEAD returned a body of %d bytes, want none", len(headBody))
 	}
 
-	for _, header := range []string{"Content-Type", "Content-Length", "ETag", "Accept-Ranges"} {
+	for _, header := range []string{"Content-Type", "Content-Length", "ETag", "Accept-Ranges", "X-Content-SHA256"} {
 		if got, want := headResp.Header.Get(header), getResp.Header.Get(header); got != want {
 			t.Fatalf("%s on HEAD is %q, want the GET value %q", header, got, want)
 		}
@@ -238,6 +244,50 @@ func TestHeadReturnsMetadataAndNoBody(t *testing.T) {
 
 	if gets := store.recordedGets(); len(gets) != 1 {
 		t.Fatalf("storage recorded %d object reads, want only the GET's: HEAD must not open the object", len(gets))
+	}
+}
+
+func TestContentAdvertisesSHA256(t *testing.T) {
+	content := patternBytes(4096)
+
+	store := newFakeStorage()
+	metadata := files.NewMemory()
+	app := New(Deps{Files: metadata, Storage: store, PresignTTL: testPresignTTL})
+	file := seedFile(t, metadata, store, "digest.bin", "application/octet-stream", content)
+
+	digest, _, err := sha256Hex(bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("hashing the content: %v", err)
+	}
+	if file.SHA256 != digest {
+		t.Fatalf("the seeded metadata carries sha256 %q, want %q", file.SHA256, digest)
+	}
+
+	resp, body := fetchContent(t, app, "GET", contentPath(file.ID), "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("GET status %d, want 200 (body %s)", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-Content-SHA256"); got != digest {
+		t.Fatalf("GET X-Content-SHA256 %q, want the stored digest %q", got, digest)
+	}
+
+	headResp, headBody := fetchContent(t, app, "HEAD", contentPath(file.ID), "")
+	if headResp.StatusCode != 200 {
+		t.Fatalf("HEAD status %d, want 200 (body %s)", headResp.StatusCode, headBody)
+	}
+	if got := headResp.Header.Get("X-Content-SHA256"); got != digest {
+		t.Fatalf("HEAD X-Content-SHA256 %q, want the stored digest %q", got, digest)
+	}
+
+	rangeResp, rangeBody := fetchContent(t, app, "GET", contentPath(file.ID), "bytes=0-511")
+	if rangeResp.StatusCode != 206 {
+		t.Fatalf("range status %d, want 206 (body %s)", rangeResp.StatusCode, rangeBody)
+	}
+	if got := rangeResp.Header.Get("X-Content-SHA256"); got != digest {
+		t.Fatalf("range X-Content-SHA256 %q, want the stored digest %q", got, digest)
+	}
+	if !bytes.Equal(rangeBody, content[:512]) {
+		t.Fatalf("range body of %d bytes differs from the %d bytes it asks for", len(rangeBody), 512)
 	}
 }
 

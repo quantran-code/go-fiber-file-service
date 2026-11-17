@@ -21,12 +21,12 @@ type File struct {
 	Name        string    `json:"name"`
 	Size        int64     `json:"size"`
 	ContentType string    `json:"contentType"`
-	SHA256      string    `json:"sha256,omitempty"`
+	SHA256      string    `json:"sha256"`
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
 // Store keeps the file metadata. The feature tickets use Add, Get, List and
-// Delete; Replace lets the hash ticket fill in a value after the upload.
+// Delete; Replace overwrites the record of an existing id.
 type Store interface {
 	Add(File) error
 	Get(id string) (File, bool)
