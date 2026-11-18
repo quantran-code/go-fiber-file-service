@@ -41,6 +41,7 @@ func New(deps Deps) *fiber.App {
 	})
 
 	registerFileRoutes(app, deps)
+	registerUploadRoutes(app, deps)
 
 	return app
 }
