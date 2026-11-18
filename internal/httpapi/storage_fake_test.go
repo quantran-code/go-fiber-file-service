@@ -46,6 +46,7 @@ type fakeStorage struct {
 	putErr       error
 	getErr       error
 	statErr      error
+	deleteErr    error
 	overrideKey  string
 	override     []byte
 }
@@ -238,11 +239,16 @@ func (f *fakeStorage) PresignGet(ctx context.Context, key string, ttl time.Durat
 	return "https://storage.invalid/" + key, nil
 }
 
-// Delete records the key and drops the object.
+// Delete records the key and drops the object. When deleteErr is set the call
+// fails instead and the object is left in place, so a test can drive the
+// storage-failure path of the delete route.
 func (f *fakeStorage) Delete(ctx context.Context, key string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, key)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.objects, key)
 	delete(f.contentTypes, key)
 	return nil

@@ -511,11 +511,118 @@ func handleIntegrity(deps Deps) fiber.Handler {
 	}
 }
 
-// handleListFiles returns the metadata of every stored file, newest first. It
-// never touches object storage.
+// Paging defaults and bounds of the listing route.
+const (
+	// defaultPage is the page a listing without a page parameter answers.
+	defaultPage = 1
+
+	// defaultPageSize is the number of records a listing without a page_size
+	// parameter answers.
+	defaultPageSize = 20
+
+	// maxPageSize bounds the records one page may carry.
+	maxPageSize = 100
+)
+
+// errInvalidPaging reports a page or page_size query value that cannot be used.
+var errInvalidPaging = errors.New("invalid paging")
+
+// paging is the resolved page a listing asks for.
+type paging struct {
+	Page     int
+	PageSize int
+}
+
+// parsePaging resolves the page and page_size query values of a listing. An
+// absent or empty value takes the default, while a value that is not a page
+// number in range is rejected instead of being clamped.
+func parsePaging(c *fiber.Ctx) (paging, error) {
+	resolved := paging{Page: defaultPage, PageSize: defaultPageSize}
+
+	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+		page, err := strconv.Atoi(raw)
+		if err != nil || page < 1 {
+			return paging{}, errInvalidPaging
+		}
+		resolved.Page = page
+	}
+
+	if raw := strings.TrimSpace(c.Query("page_size")); raw != "" {
+		size, err := strconv.Atoi(raw)
+		if err != nil || size < 1 || size > maxPageSize {
+			return paging{}, errInvalidPaging
+		}
+		resolved.PageSize = size
+	}
+
+	return resolved, nil
+}
+
+// filterByName keeps the records whose name contains name, ignoring case. An
+// empty name keeps every record.
+func filterByName(records []files.File, name string) []files.File {
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return records
+	}
+
+	matched := make([]files.File, 0, len(records))
+	for _, record := range records {
+		if strings.Contains(strings.ToLower(record.Name), needle) {
+			matched = append(matched, record)
+		}
+	}
+	return matched
+}
+
+// pageOf returns the records of one page. A page past the end carries no
+// records, and the result is never nil so an empty page encodes as [].
+func pageOf(records []files.File, p paging) []files.File {
+	// Dividing before multiplying keeps a very large page number from
+	// overflowing the index arithmetic below.
+	if p.Page-1 > len(records)/p.PageSize {
+		return []files.File{}
+	}
+
+	start := (p.Page - 1) * p.PageSize
+	if start >= len(records) {
+		return []files.File{}
+	}
+
+	end := start + p.PageSize
+	if end > len(records) {
+		end = len(records)
+	}
+	return records[start:end]
+}
+
+// listResponse is the body of the listing route. Items carries the same record
+// the single-metadata route returns and is never null.
+type listResponse struct {
+	Items    []files.File `json:"items"`
+	Total    int          `json:"total"`
+	Page     int          `json:"page"`
+	PageSize int          `json:"page_size"`
+}
+
+// handleListFiles returns one page of the stored file metadata, newest first,
+// optionally filtered by a substring of the name. It never touches object
+// storage.
 func handleListFiles(deps Deps) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		return c.JSON(deps.Files.List())
+		requested, err := parsePaging(c)
+		if err != nil {
+			return writeError(c, fiber.StatusBadRequest, "invalid paging")
+		}
+
+		matched := filterByName(deps.Files.List(), c.Query("name"))
+
+		return c.JSON(listResponse{
+			Items:    pageOf(matched, requested),
+			Total:    len(matched),
+			Page:     requested.Page,
+			PageSize: requested.PageSize,
+		})
 	}
 }
 
@@ -531,11 +638,40 @@ func handleFileMetadata(deps Deps) fiber.Handler {
 	}
 }
 
+// handleDeleteFile removes a file's object and then its metadata record. The
+// object goes first, so a storage failure leaves the record listed and the
+// request can be retried; an object that is already gone counts as deleted.
+func handleDeleteFile(deps Deps) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		file, ok := deps.Files.Get(c.Params("id"))
+		if !ok {
+			return writeError(c, fiber.StatusNotFound, "file not found")
+		}
+		if deps.Storage == nil {
+			return writeError(c, fiber.StatusServiceUnavailable, "storage unavailable")
+		}
+
+		// writeStorageError is not reused here: it maps a missing object to 404,
+		// while a record whose object already went away still has to be removed.
+		if err := deps.Storage.Delete(c.Context(), file.Key); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return writeError(c, fiber.StatusBadGateway, "storage unavailable")
+		}
+
+		if err := deps.Files.Delete(file.ID); err != nil {
+			return writeError(c, fiber.StatusInternalServerError, "internal error")
+		}
+
+		c.Status(fiber.StatusNoContent)
+		return nil
+	}
+}
+
 // registerFileRoutes mounts the file routes on the application.
 func registerFileRoutes(app *fiber.App, deps Deps) {
 	app.Post("/files", handleUpload(deps))
 	app.Get("/files", handleListFiles(deps))
 	app.Get("/files/:id", handleFileMetadata(deps))
+	app.Delete("/files/:id", handleDeleteFile(deps))
 	// app.Get also registers a HEAD route carrying the same handler, which
 	// would win over the explicit HEAD route below and make a HEAD request
 	// open the object. Adding the GET method directly keeps the two apart.

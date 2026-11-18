@@ -129,6 +129,76 @@ one.
 | `502` | `{"error":"storage unavailable"}` | the object store failed |
 | `503` | `{"error":"storage unavailable"}` | the service has no object store configured |
 
+## File metadata
+
+The metadata routes list, read and delete the records the upload routes create.
+They never stream file bytes. The internal object-store key is never returned in
+any response: a listing entry and a metadata body carry exactly the fields shown
+below.
+
+### `GET /files`
+
+Lists the stored files newest first, ordered by `createdAt` and — when two
+records were created at the same instant — by descending `id`.
+
+| Query | Purpose | Default |
+|---|---|---|
+| `page` | 1-based page number | `1` |
+| `page_size` | records per page, 1..100 | `20` |
+| `name` | case-insensitive substring of the file name | — |
+
+An absent or empty parameter takes its default. A `page` below 1, a `page_size`
+below 1 or above 100, or a value that is not a number answers
+`400 {"error":"invalid paging"}`. A page past the last one answers an empty
+`items` array, and `total` always counts the whole matching set, unchanged by the
+`page` argument.
+
+`200 OK`:
+
+```json
+{
+  "items": [
+    {
+      "id": "0b41...",
+      "name": "shot.png",
+      "size": 1024,
+      "contentType": "image/png",
+      "sha256": "9c56...",
+      "createdAt": "2024-01-01T00:00:04Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "page_size": 20
+}
+```
+
+`items` is always an array: `[]` when nothing matches, never `null`.
+
+### `GET /files/{id}`
+
+`200 OK` answers one record with the same fields as an `items` entry: `id`,
+`name`, `size`, `contentType`, `sha256` and `createdAt`. `sha256` is always
+present and is an empty string when no digest is recorded. An unknown id answers
+`404 {"error":"file not found"}`.
+
+### `DELETE /files/{id}`
+
+Removes the object from the object store and then its metadata record, answering
+`204 No Content` with an empty body. An unknown id answers
+`404 {"error":"file not found"}` without touching the object store. An object the
+store reports as already gone still counts as deleted, so its metadata is removed
+and the answer is `204`.
+
+### Errors
+
+| Status | Body | When |
+|---|---|---|
+| `400` | `{"error":"invalid paging"}` | `page` or `page_size` is not a usable page number |
+| `404` | `{"error":"file not found"}` | no file has the requested id |
+| `502` | `{"error":"storage unavailable"}` | the object store failed during the delete; the metadata is kept so the file stays listed |
+| `503` | `{"error":"storage unavailable"}` | deleting without an object store configured; the metadata is kept |
+
 ## Test
 
 ```sh
